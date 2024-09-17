@@ -1,14 +1,20 @@
 const std = @import("std");
 
-const argon2 = std.crypto.pwhash.argon2;
 const sha2 = std.crypto.hash.sha2;
 const hmac = std.crypto.auth.hmac;
 const aes = std.crypto.core.aes;
 
 const cbc_decrypt = @import("cbc_decrypt.zig");
 const uuid = @import("uuid.zig");
+
 const err = @import("error.zig");
 const Error = err.Error;
+
+const kdf = @import("kdf.zig");
+const KdfParams = kdf.KdfParams;
+const AesKdfParams = kdf.AesKdfParams;
+const Argon2Params = kdf.Argon2Params;
+
 const endOfHeader = [_]u8{ 0x0D, 0x0A, 0x0D, 0x0A };
 
 pub const Reader = struct {
@@ -73,24 +79,6 @@ pub const Reader = struct {
 };
 
 
-const AesKdfParams = struct { 
-    salt: ?[]u8, 
-    rounds: ?u64 
-};
-
-const Argon2Params = struct { 
-    isHybrid: bool,
-    version: ?u32,
-    salt: ?[]u8,
-    it: ?u64,
-    mem: ?u64,
-    par: ?u32
-};
-
-const KdfParams = union(enum) {
-    aesKdf: AesKdfParams,
-    argon2: Argon2Params,
-};
 
 const CustomData = struct {};
 const Header = struct { 
@@ -339,101 +327,86 @@ pub fn read_kdbx(
     // make a reader for this pointer slice reading
     const header = try parseHeader(r);
 
-    switch (header.kdfParams.?) {
-        .aesKdf => |*params| {
-            std.debug.print("aes-kdf params: {}", .{params.*});
-        },
-        .argon2 => |*params| {
-            // 32 byte is the length of the salt
-            var derivedKey: [32]u8 = undefined;
-            const mode: argon2.Mode = if (!params.*.isHybrid) .argon2d else .argon2id;
-            argon2.kdf(
-                allocator,
-                &derivedKey,
-                finalPasswd,
-                params.*.salt.?,
-                .{
-                    .t = @intCast(params.*.it.?),
-                    // The api expects the memory to be in kibibytes
-                    .m = @intCast(params.*.mem.? / 1024),
-                    .p = @intCast(params.*.par.?)
-                },
-                mode
-            ) catch return Error.UnsupportedKDF;
 
-            // TODO: Clean up this mess
-            
-            
-            // The encryption key is somehow 32 bytes as well...
-            var encryptionKey: [32]u8 = undefined;
-            // The salt is 32 byte long
-            const concated = header.masterSalt.?[0..32].* ++ derivedKey;
-            sha2.Sha256.hash(&concated, &encryptionKey, .{});
+    // TODO: Clean up this mess
+    
+    var derivedKey: [32]u8 = undefined;
 
-            const hmacConcated = concated ++ [_]u8{0x01};
-            var intermediateHash: [64]u8 = undefined;
-            sha2.Sha512.hash(&hmacConcated, &intermediateHash, .{});
+    try kdf.deriveKey(
+        allocator, 
+        header.kdfParams.?, 
+        finalPasswd, 
+        &derivedKey
+    );
 
-            const intConcated = [_]u8{0xFF} ** 8 ++ intermediateHash;
-            var hmacHashKey: [64]u8 = undefined;
-            sha2.Sha512.hash(&intConcated, &hmacHashKey, .{});
+    // The encryption key is somehow 32 bytes as well...
+    var encryptionKey: [32]u8 = undefined;
+    // The salt is 32 byte long
+    const concated = header.masterSalt.?[0..32].* ++ derivedKey;
+    sha2.Sha256.hash(&concated, &encryptionKey, .{});
 
-            const headerData = r.ptr[0..r.idx];
+    const hmacConcated = concated ++ [_]u8{0x01};
+    var intermediateHash: [64]u8 = undefined;
+    sha2.Sha512.hash(&hmacConcated, &intermediateHash, .{});
 
-            const headerSha256 = r.readN(32);
-            var headerShaActual: [32]u8 = undefined;
-            sha2.Sha256.hash(headerData, &headerShaActual, .{});
+    const intConcated = [_]u8{0xFF} ** 8 ++ intermediateHash;
+    var hmacHashKey: [64]u8 = undefined;
+    sha2.Sha512.hash(&intConcated, &hmacHashKey, .{});
 
-            if (!std.mem.eql(u8, headerSha256, &headerShaActual)) {
-                return Error.CorruptedHeader;
-            }
+    const headerData = r.ptr[0..r.idx];
 
-            const headerHmac256 = r.readN(32);
-            var headerHmacActual: [32]u8 = undefined;
-            hmac.sha2.HmacSha256.create(&headerHmacActual, headerData, &hmacHashKey);
+    const headerSha256 = r.readN(32);
+    var headerShaActual: [32]u8 = undefined;
+    sha2.Sha256.hash(headerData, &headerShaActual, .{});
 
-            if (!std.mem.eql(u8, headerHmac256, &headerHmacActual)) {
-                return Error.InvalidCredentials;
-            }
-
-            const blockIdx = [_]u8{ 0x00 } ** 8;
-            const blockHmac = r.readN(32);
-            var dataSize: u32 = undefined;
-            const p = r.readU32(&dataSize);
-            const m = r.readN(dataSize);
-
-            const block = allocator.alloc(u8, 8 + 4 + m.len) catch return Error.OutOfMemory;
-            @memcpy(block[0..12], blockIdx ++ p[0..4]);
-            @memcpy(block[block.len - m.len .. block.len], m);
-
-            var blockKey: [64]u8 = undefined;
-            const blockHmacConcated = [_]u8{ 0x00 } ** 8 ++ intermediateHash;
-            sha2.Sha512.hash(&blockHmacConcated, &blockKey, .{});
-
-            var blockHmacActual: [32]u8 = undefined;
-            hmac.sha2.HmacSha256.create(&blockHmacActual, block, &blockKey);
-             
-            if (!std.mem.eql(u8, blockHmac, &blockHmacActual)) {
-                return Error.CorruptedBlock;
-            }
-
-
-            // TODO: implement cipher block chaining mode...
-            //
-            const decrypted: []u8 = try allocator.alloc(u8, dataSize);
-
-            cbc_decrypt.cbc_aes256(
-                &encryptionKey,
-                header.nonce.?[0..16],
-                decrypted,
-                m
-            );
-
-            std.debug.print("decrypted block: {x}\n", .{decrypted});
-            const f = std.fs.cwd().createFile("decrypted", .{}) catch return;
-            _ = f.write(decrypted) catch return;
-
-            // var decrypted: [16]u8 = undefined;
-        }
+    if (!std.mem.eql(u8, headerSha256, &headerShaActual)) {
+        return Error.CorruptedHeader;
     }
+
+    const headerHmac256 = r.readN(32);
+    var headerHmacActual: [32]u8 = undefined;
+    hmac.sha2.HmacSha256.create(&headerHmacActual, headerData, &hmacHashKey);
+
+    if (!std.mem.eql(u8, headerHmac256, &headerHmacActual)) {
+        return Error.InvalidCredentials;
+    }
+
+    const blockIdx = [_]u8{ 0x00 } ** 8;
+    const blockHmac = r.readN(32);
+    var dataSize: u32 = undefined;
+    const p = r.readU32(&dataSize);
+    const m = r.readN(dataSize);
+
+    const block = allocator.alloc(u8, 8 + 4 + m.len) catch return Error.OutOfMemory;
+    @memcpy(block[0..12], blockIdx ++ p[0..4]);
+    @memcpy(block[block.len - m.len .. block.len], m);
+
+    var blockKey: [64]u8 = undefined;
+    const blockHmacConcated = [_]u8{ 0x00 } ** 8 ++ intermediateHash;
+    sha2.Sha512.hash(&blockHmacConcated, &blockKey, .{});
+
+    var blockHmacActual: [32]u8 = undefined;
+    hmac.sha2.HmacSha256.create(&blockHmacActual, block, &blockKey);
+     
+    if (!std.mem.eql(u8, blockHmac, &blockHmacActual)) {
+        return Error.CorruptedBlock;
+    }
+
+
+    // TODO: implement cipher block chaining mode...
+    //
+    const decrypted: []u8 = try allocator.alloc(u8, dataSize);
+
+    cbc_decrypt.cbc_aes256(
+        &encryptionKey,
+        header.nonce.?[0..16],
+        decrypted,
+        m
+    );
+
+    std.debug.print("decrypted block: {x}\n", .{decrypted});
+    const f = std.fs.cwd().createFile("decrypted", .{}) catch return;
+    _ = f.write(decrypted) catch return;
+
+    // var decrypted: [16]u8 = undefined;
 }
