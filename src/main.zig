@@ -134,6 +134,14 @@ fn copyFront(dest: []u8, source: []const u8) void {
     }
 }
 
+fn bytewiseXor(dest: []u8, other: []u8) void {
+    std.debug.assert(dest.len == other.len);
+
+    for (0..dest.len) |i| {
+        dest[i] ^= other[i];
+    }
+}
+
 fn copyBack(dest: []u8, source: []const u8) void {
     std.debug.assert(dest.len >= source.len);
 
@@ -449,13 +457,9 @@ pub fn main() !void {
             const p = r.readU32(&dataSize);
             const m = r.readN(dataSize);
 
-            std.debug.print("block hmac: {x}\n", .{blockHmac});
-            std.debug.print("block size: {x}\n", .{dataSize});
-
-
             const block = try allocator.alloc(u8, 8 + 4 + m.len);
-            copyFront(block, blockIdx ++ p[0..4]);
-            copyBack(block, m);
+            @memcpy(block[0..12], blockIdx ++ p[0..4]);
+            @memcpy(block[block.len - m.len .. block.len], m);
 
             var blockKey: [64]u8 = undefined;
             const blockHmacConcated = [_]u8{ 0x00 } ** 8 ++ intermediateHash;
@@ -464,17 +468,30 @@ pub fn main() !void {
             var blockHmacActual: [32]u8 = undefined;
             hmac.sha2.HmacSha256.create(&blockHmacActual, block, &blockKey);
              
-            std.debug.print("block actual hmac: {x}\n", .{blockHmacActual});
-
             if (!std.mem.eql(u8, blockHmac, &blockHmacActual)) {
                 return Error.CorruptedBlock;
             }
 
-            var decrypted: [16]u8 = undefined;
 
             // TODO: implement cipher block chaining mode...
 
-            // std.compress.gzip.decompress
+            var decrypted: []u8 = try allocator.alloc(u8, dataSize);
+            const dec = aes.Aes256.initDec(encryptionKey);
+            dec.decrypt(decrypted[0..16], m[0..16]);
+            bytewiseXor(decrypted[0..16], header.nonce.?[0..16]);
+
+            for (1 .. m.len / 16) |i| {
+                const start = i * 16;
+                const end = i * 16 + 16;
+                dec.decrypt(decrypted[start .. end][0..16], m[start .. end][0..16]);
+                bytewiseXor(decrypted[start .. end], m[start - 16 .. end - 16]);
+            }
+
+
+            std.debug.print("decrypted block: {x}\n", .{decrypted});
+            const f = try std.fs.cwd().createFile("decrypted", .{});
+            _ = try f.write(decrypted);
+            // var decrypted: [16]u8 = undefined;
         }
     }
 }
