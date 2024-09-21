@@ -1,12 +1,13 @@
+// TODO: Migrate the code to use a fixed buffer stream
 const std = @import("std");
 
 const sha2 = std.crypto.hash.sha2;
 const hmac = std.crypto.auth.hmac;
 const aes = std.crypto.core.aes;
+const gzip = std.compress.gzip;
 
 const cbc_decrypt = @import("cbc_decrypt.zig");
 const uuid = @import("uuid.zig");
-
 const err = @import("error.zig");
 const Error = err.Error;
 
@@ -17,15 +18,37 @@ const Argon2Params = kdf.Argon2Params;
 
 const endOfHeader = [_]u8{ 0x0D, 0x0A, 0x0D, 0x0A };
 
+fn intToBytes(comptime T: type, v: T) [@divExact(@typeInfo(T).Int.bits, 8)]u8 {
+    const n = comptime @divExact(@typeInfo(T).Int.bits, 8);
+    var out: [n]u8 = undefined;
+    for (0..n) |i| {
+        out[i] = @intCast((v >> @intCast(i * 8)) & 0xFF);
+    }
+
+    return out;
+}
+
+const Compression = enum(u32) { gzip = 1, none = 0 };
+
 pub const Reader = struct {
     ptr: []u8,
     idx: u32,
 
     pub fn init(ptr: []u8) Reader {
-        return Reader{
-            .ptr = ptr,
-            .idx = 0
-        };
+        return Reader{ .ptr = ptr, .idx = 0 };
+    }
+
+    fn readAll(self: *Reader) []u8 {
+        const res = self.ptr[self.idx..];
+        self.idx = @intCast(self.ptr.len);
+        return res;
+    }
+
+    fn readInt(self: *Reader, comptime T: type) T {
+        const size = comptime @divExact(@typeInfo(T).Int.bits, 8);
+        const res = std.mem.readInt(T, self.ptr[self.idx..][0..size], std.builtin.Endian.little);
+        self.idx += size;
+        return res;
     }
 
     fn readN(self: *Reader, n: u32) []u8 {
@@ -39,84 +62,15 @@ pub const Reader = struct {
         self.idx += 1;
         return res;
     }
-
-    // TODO: Probably this reading interface is very inefficient...
-    
-    fn readU16(self: *Reader, v: *u16) []u8 {
-        v.* = @as(u16, @intCast(self.ptr[self.idx])) 
-            | @as(u16, @intCast(self.ptr[self.idx + 1])) << @intCast(8);
-
-        const res = self.ptr[self.idx .. self.idx + 2];
-        self.idx += 2;
-        return res;
-    }
-
-    fn readU32(self: *Reader, v: *u32) []u8 {
-        v.* = @as(u32, @intCast(self.ptr[self.idx])) 
-            | @as(u32, @intCast(self.ptr[self.idx + 1])) << @intCast(8) 
-            | @as(u32, @intCast(self.ptr[self.idx + 2])) << @intCast(16) 
-            | @as(u32, @intCast(self.ptr[self.idx + 3])) << @intCast(24);
-
-        const res = self.ptr[self.idx .. self.idx + 4];
-        self.idx += 4;
-        return res;
-    }
-
-    fn readU64(self: *Reader, v: *u64) []u8 {
-        v.* = @as(u64, @intCast(self.ptr[self.idx])) 
-            | @as(u64, @intCast(self.ptr[self.idx + 1])) << @intCast(8) 
-            | @as(u64, @intCast(self.ptr[self.idx + 2])) << @intCast(16) 
-            | @as(u64, @intCast(self.ptr[self.idx + 3])) << @intCast(24) 
-            | @as(u64, @intCast(self.ptr[self.idx + 4])) << @intCast(32) 
-            | @as(u64, @intCast(self.ptr[self.idx + 5])) << @intCast(40) 
-            | @as(u64, @intCast(self.ptr[self.idx + 6])) << @intCast(48) 
-            | @as(u64, @intCast(self.ptr[self.idx + 7])) << @intCast(54);
-
-        const res = self.ptr[self.idx .. self.idx + 8];
-        self.idx += 8;
-        return res;
-    }
 };
-
-
 
 const CustomData = struct {};
-const Header = struct { 
-    encAlgo: ?[]u8, 
-    compAlgo: ?u32, 
-    masterSalt: ?[]u8, 
-    nonce: ?[]u8, 
-    kdfParams: ?KdfParams, 
-    customData: ?CustomData 
-};
-
-fn copyFront(dest: []u8, source: []const u8) void {
-    std.debug.assert(dest.len >= source.len);
-
-    for (0..source.len) |i| {
-        dest[i] = source[i];
-    }
-}
-
-
-fn copyBack(dest: []u8, source: []const u8) void {
-    std.debug.assert(dest.len >= source.len);
-
-    var destI = dest.len;
-    var sourceI = source.len;
-
-    while (sourceI > 0) {
-        sourceI -= 1;
-        destI -= 1;
-
-        dest[destI] = source[sourceI];
-    }
-}
+const Header = struct { encAlgo: ?[]u8, compAlgo: ?Compression, masterSalt: ?[]u8, nonce: ?[]u8, kdfParams: ?KdfParams, customData: ?CustomData };
+const InnerHeader = struct { innerEncAlgo: ?u32, innerEncKey: ?[]u8, binaryContent: ?[]u8 };
 
 fn parseKdfParams(r: *Reader) Error!KdfParams {
     var kdfParams: ?KdfParams = null;
-    var v: u16 = undefined;
-    _ = r.readU16(&v);
+    const v = r.readInt(u16);
 
     if (v != 0x100) {
         return Error.UnsupportedKDFVersion;
@@ -132,32 +86,23 @@ fn parseKdfParams(r: *Reader) Error!KdfParams {
                 return kdfParams.?;
             },
             else => {
-                var nameSize: u32 = undefined; 
-                _ = r.readU32(&nameSize);
+                const nameSize = r.readInt(u32);
                 const name = r.readN(nameSize);
-                var valueSize: u32 = undefined;
-                _ = r.readU32(&valueSize);
+                const valueSize = r.readInt(u32);
 
                 if (std.mem.eql(u8, name, "$UUID")) {
                     const value = r.readN(valueSize);
                     if (std.mem.eql(u8, value, &uuid.aes256)) {
-                        kdfParams = KdfParams{ 
-                            .aesKdf = AesKdfParams{
-                                .salt = null,
-                                .rounds = null
-                            }
-                        };
+                        kdfParams = KdfParams{ .aesKdf = AesKdfParams{ .salt = null, .rounds = null } };
                     } else if (std.mem.eql(u8, value, &uuid.argon2d) or std.mem.eql(u8, value, &uuid.argon2id)) {
-                        kdfParams = KdfParams{ 
-                            .argon2 = Argon2Params{ 
-                                .isHybrid = std.mem.eql(u8, value, &uuid.argon2id),
-                                .version = null,
-                                .salt = null,
-                                .it = null,
-                                .mem = null,
-                                .par = null,
-                            }
-                        };
+                        kdfParams = KdfParams{ .argon2 = Argon2Params{
+                            .isHybrid = std.mem.eql(u8, value, &uuid.argon2id),
+                            .version = null,
+                            .salt = null,
+                            .it = null,
+                            .mem = null,
+                            .par = null,
+                        } };
                     } else {
                         return Error.UnsupportedKDF;
                     }
@@ -170,8 +115,7 @@ fn parseKdfParams(r: *Reader) Error!KdfParams {
                         .aesKdf => |*params| {
                             if (std.mem.eql(u8, name, "R")) {
                                 std.debug.assert(valueSize == 8);
-                                params.*.rounds = undefined;
-                                _ = r.readU64(&params.*.rounds.?); 
+                                params.*.rounds = r.readInt(u64);
                             } else if (std.mem.eql(u8, name, "S")) {
                                 std.debug.assert(valueSize == 8);
                                 params.*.salt = r.readN(valueSize);
@@ -182,23 +126,19 @@ fn parseKdfParams(r: *Reader) Error!KdfParams {
                         .argon2 => |*params| {
                             if (std.mem.eql(u8, name, "V")) {
                                 std.debug.assert(valueSize == 4);
-                                params.*.version = undefined;
-                                _ = r.readU32(&params.*.version.?); 
+                                params.*.version = r.readInt(u32);
                             } else if (std.mem.eql(u8, name, "S")) {
                                 params.*.salt = r.readN(valueSize);
                             } else if (std.mem.eql(u8, name, "I")) {
-                                params.*.it = undefined;
-                                _ = r.readU64(&params.*.it.?);
+                                params.*.it = r.readInt(u64);
                             } else if (std.mem.eql(u8, name, "M")) {
-                                params.*.mem = undefined;
-                                _ = r.readU64(&params.*.mem.?);
+                                params.*.mem = r.readInt(u64);
                             } else if (std.mem.eql(u8, name, "P")) {
-                                params.*.par = undefined;
-                                _ = r.readU32(&params.*.par.?);
+                                params.*.par = r.readInt(u32);
                             } else {
                                 return Error.CorruptedHeader;
                             }
-                        }
+                        },
                     }
                 }
             },
@@ -212,48 +152,46 @@ fn parseCustomData(_: []u8) Error!CustomData {
     return Error.CorruptedHeader;
 }
 
-fn parseInnerHeader(r: *Reader) void {
+fn parseInnerHeader(r: *Reader) Error!InnerHeader {
+    var innerHeader = InnerHeader{ .innerEncAlgo = null, .innerEncKey = null, .binaryContent = null };
+
+    // TODO: add checks whether all fields were set
     while (true) {
         const kind = r.readByte();
-        var size: u32 = undefined;
-        _ = r.readU32(&size);
+        const size = r.readInt(u32);
 
         switch (kind) {
             0 => {
                 // end of header
-                return;
+                return innerHeader;
             },
             1 => {
                 // inner encryption algorithm, int32
                 std.debug.assert(size == 4);
-                var innerEncAlgo: u32 = undefined;
-                _ = r.readU32(&innerEncAlgo);
-                std.debug.print("{}\n", .{innerEncAlgo});
+                innerHeader.innerEncAlgo = r.readInt(u32);
             },
             2 => {
-                // inner encryption, bytes
+                // inner encryption key, bytes
+                innerHeader.innerEncKey = r.readN(size);
             },
             3 => {
                 // binary content, bytes
+                innerHeader.binaryContent = r.readN(size);
+            },
+            else => {
+                std.debug.print("kind: {}\n", .{kind});
+                return Error.CorruptedInnerHeader;
             },
         }
     }
 }
 
 fn parseHeader(r: *Reader) Error!Header {
-    var header: Header = Header{ 
-        .encAlgo = null, 
-        .compAlgo = null, 
-        .masterSalt = null, 
-        .nonce = null, 
-        .kdfParams = null, 
-        .customData = null 
-    };
+    var header: Header = Header{ .encAlgo = null, .compAlgo = null, .masterSalt = null, .nonce = null, .kdfParams = null, .customData = null };
 
     while (true) {
         const id = r.readByte();
-        var size: u32 = undefined;
-        _ = r.readU32(&size);
+        const size = r.readInt(u32);
 
         switch (id) {
             0 => {
@@ -263,7 +201,7 @@ fn parseHeader(r: *Reader) Error!Header {
                 if (!std.mem.eql(u8, value, &endOfHeader)) {
                     return Error.CorruptedHeader;
                 }
-                
+
                 return header;
             },
             2 => {
@@ -274,13 +212,12 @@ fn parseHeader(r: *Reader) Error!Header {
             3 => {
                 // compression algorithm uint32, we only use the first byte as this is 0 or 1
                 std.debug.assert(size == 4);
-                header.compAlgo = undefined;
-                _ = r.readU32(&header.compAlgo.?); 
+                header.compAlgo = @enumFromInt(r.readInt(u32));
             },
             4 => {
-                // salt, 32 bytes
+                // compression algorithm uint32, we only use the first byte as this is 0 or 1
                 std.debug.assert(size == 32);
-                header.masterSalt = r.readN(32);
+                header.masterSalt = r.readN(size);
             },
             7 => {
                 // nonce, byte array
@@ -296,49 +233,37 @@ fn parseHeader(r: *Reader) Error!Header {
                 // header.customData = customData;
             },
             else => {
+                std.debug.print("id: {}\n", .{id});
                 return Error.CorruptedHeader;
             },
         }
     }
 }
 
-pub fn read_kdbx(
-    allocator: std.mem.Allocator, 
-    r: *Reader,
-    finalPasswd: []u8
-) Error!void {
-    var sig1: u32 = undefined;
-    _ = r.readU32(&sig1);
+fn readSignature(r: *Reader) Error!void {
+    const sig1 = r.readInt(u32);
     if (sig1 != 0x9aa2d903) {
         return Error.CorruptedSignature;
     }
 
-    var sig2: u32 = undefined;
-    _ = r.readU32(&sig2);
+    const sig2 = r.readInt(u32);
     if (sig2 != 0xb54bfb67) {
         return Error.CorruptedSignature;
     }
 
-    var version: u32 = undefined;
-    _ = r.readU32(&version);
+    const version = r.readInt(u32);
+    std.debug.print("version: {x}\n", .{version});
+}
+
+pub fn read_kdbx(allocator: std.mem.Allocator, r: *Reader, finalPasswd: []u8) Error!void {
     // TODO: add proper version checking
-    
-    std.debug.print("Version: {x}\n", .{version});
-    // make a reader for this pointer slice reading
+
+    try readSignature(r);
     const header = try parseHeader(r);
-
-
     // TODO: Clean up this mess
-    
+
     var derivedKey: [32]u8 = undefined;
-
-    try kdf.deriveKey(
-        allocator, 
-        header.kdfParams.?, 
-        finalPasswd, 
-        &derivedKey
-    );
-
+    try kdf.deriveKey(allocator, header.kdfParams.?, finalPasswd, &derivedKey);
     // The encryption key is somehow 32 bytes as well...
     var encryptionKey: [32]u8 = undefined;
     // The salt is 32 byte long
@@ -354,7 +279,6 @@ pub fn read_kdbx(
     sha2.Sha512.hash(&intConcated, &hmacHashKey, .{});
 
     const headerData = r.ptr[0..r.idx];
-
     const headerSha256 = r.readN(32);
     var headerShaActual: [32]u8 = undefined;
     sha2.Sha256.hash(headerData, &headerShaActual, .{});
@@ -371,42 +295,57 @@ pub fn read_kdbx(
         return Error.InvalidCredentials;
     }
 
-    const blockIdx = [_]u8{ 0x00 } ** 8;
-    const blockHmac = r.readN(32);
-    var dataSize: u32 = undefined;
-    const p = r.readU32(&dataSize);
-    const m = r.readN(dataSize);
+    // TODO: Parallelize reading of blocks and compression
+    var blockIdx: u64 = 0;
+    var decompressed = std.ArrayList(u8).initCapacity(allocator, r.ptr.len * 10) catch return Error.OutOfMemory;
+    defer decompressed.deinit();
+    var writer = decompressed.writer();
 
-    const block = allocator.alloc(u8, 8 + 4 + m.len) catch return Error.OutOfMemory;
-    @memcpy(block[0..12], blockIdx ++ p[0..4]);
-    @memcpy(block[block.len - m.len .. block.len], m);
+    while (true) {
+        const blockHmac = r.readN(32);
+        const dataSize = r.readInt(u32);
 
-    var blockKey: [64]u8 = undefined;
-    const blockHmacConcated = [_]u8{ 0x00 } ** 8 ++ intermediateHash;
-    sha2.Sha512.hash(&blockHmacConcated, &blockKey, .{});
+        if (dataSize == 0) {
+            break;
+        }
 
-    var blockHmacActual: [32]u8 = undefined;
-    hmac.sha2.HmacSha256.create(&blockHmacActual, block, &blockKey);
-     
-    if (!std.mem.eql(u8, blockHmac, &blockHmacActual)) {
-        return Error.CorruptedBlock;
+        const m = r.readN(dataSize);
+        const block = allocator.alloc(u8, 8 + 4 + m.len) catch return Error.OutOfMemory;
+        const idxBytes = intToBytes(u64, blockIdx);
+        const sizeBytes = intToBytes(u32, dataSize);
+        @memcpy(block[0..8], &idxBytes);
+        @memcpy(block[8..12], &sizeBytes);
+        @memcpy(block[block.len - m.len .. block.len], m);
+
+        var blockKey: [64]u8 = undefined;
+        // TODO: Optimize this to only increment and not concatenate every time
+        const blockHmacConcated = idxBytes ++ intermediateHash;
+        sha2.Sha512.hash(&blockHmacConcated, &blockKey, .{});
+
+        var blockHmacActual: [32]u8 = undefined;
+        hmac.sha2.HmacSha256.create(&blockHmacActual, block, &blockKey);
+
+        if (!std.mem.eql(u8, blockHmac, &blockHmacActual)) {
+            return Error.CorruptedBlock;
+        }
+
+        const decrypted: []u8 = try allocator.alloc(u8, dataSize);
+        cbc_decrypt.cbc_aes256(&encryptionKey, header.nonce.?[0..16], decrypted, m);
+        switch (header.compAlgo.?) {
+            .none => {
+                _ = writer.write(decrypted) catch return Error.OutOfMemory;
+            },
+            .gzip => {
+                var fb = std.io.fixedBufferStream(decrypted);
+                gzip.decompress(fb.reader(), writer) catch return Error.CorruptedCompression;
+            },
+        }
+
+        blockIdx += 1;
     }
 
-
-    // TODO: implement cipher block chaining mode...
-    //
-    const decrypted: []u8 = try allocator.alloc(u8, dataSize);
-
-    cbc_decrypt.cbc_aes256(
-        &encryptionKey,
-        header.nonce.?[0..16],
-        decrypted,
-        m
-    );
-
-    std.debug.print("decrypted block: {x}\n", .{decrypted});
-    const f = std.fs.cwd().createFile("decrypted", .{}) catch return;
-    _ = f.write(decrypted) catch return;
-
-    // var decrypted: [16]u8 = undefined;
+    var rInner = Reader.init(decompressed.items);
+    const innerHeader = try parseInnerHeader(&rInner);
+    std.debug.print("{}\n", .{innerHeader});
+    std.debug.print("{s}\n", .{rInner.readAll()});
 }

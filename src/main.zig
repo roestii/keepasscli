@@ -1,5 +1,7 @@
 const std = @import("std");
-const c = @cImport({@cInclude("unistd.h");});
+const c = @cImport({
+    @cInclude("unistd.h");
+});
 
 const gzip = std.compress.gzip;
 const sha2 = std.crypto.hash.sha2;
@@ -25,14 +27,7 @@ pub fn main() !void {
     const file = try std.fs.cwd().openFile(in, .{ .mode = .read_write });
     const md = try file.metadata();
 
-    const ptr = try std.posix.mmap(
-        null, 
-        @intCast(md.size()),
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{ .TYPE = .SHARED }, 
-        file.handle, 0
-    );
-
+    const ptr = try std.posix.mmap(null, @intCast(md.size()), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
 
     var r = kdbx_reader.Reader.init(ptr);
     try kdbx_reader.read_kdbx(allocator, &r, &finalPasswd);

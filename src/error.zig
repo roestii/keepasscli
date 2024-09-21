@@ -1,10 +1,1 @@
-pub const Error = error{
-    CorruptedSignature,
-    CorruptedHeader,
-    CorruptedBlock,
-    UnsupportedKDF,
-    UnsupportedKDFVersion,
-    UnsupportedVersion, 
-    InvalidCredentials,
-    OutOfMemory
-};
+pub const Error = error{ CorruptedInnerHeader, CorruptedSignature, CorruptedCompression, CorruptedHeader, CorruptedBlock, UnsupportedKDF, UnsupportedKDFVersion, UnsupportedVersion, InvalidCredentials, OutOfMemory };
